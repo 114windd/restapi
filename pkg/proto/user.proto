@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package user;
+
+option go_package = "github.com/114windd/restapi/pkg/proto";
+
+service UserService {
+  rpc CreateUser(CreateUserRequest) returns (UserResponse);
+  rpc GetUser(GetUserRequest) returns (UserResponse);
+  rpc UpdateUser(UpdateUserRequest) returns (UserResponse);
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+}
+
+message ProtoUser {
+  uint32 id = 1;
+  string name = 2;
+  string email = 3;
+  string created_at = 4;
+  string updated_at = 5;
+}
+
+message CreateUserRequest {
+  string name = 1;
+  string email = 2;
+  string password = 3;
+}
+
+message GetUserRequest {
+  uint32 id = 1;
+}
+
+message UpdateUserRequest {
+  uint32 id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+message DeleteUserRequest {
+  uint32 id = 1;
+}
+
+message UserResponse {
+  ProtoUser user = 1;
+  string message = 2;
+}
+
+message DeleteUserResponse {
+  string message = 1;
+}
+
+message ListUsersRequest {}
+
+message ListUsersResponse {
+  repeated ProtoUser users = 1;
+}
