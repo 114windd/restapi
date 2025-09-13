@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -48,11 +47,17 @@ var (
 )
 
 func main() {
+	// Initialize logger first
+	Init()
+	Log.Info("Starting REST API server")
+
 	// Initialize database
 	initDB()
 
-	// Setup Gin router
-	r := gin.Default()
+	// Setup Gin router with logging middleware
+	r := gin.New()
+	r.Use(loggingMiddleware())
+	r.Use(gin.Recovery())
 
 	// Public routes
 	r.POST("/signup", signup)
@@ -68,7 +73,7 @@ func main() {
 		protected.DELETE("/users/:id", deleteUser)
 	}
 
-	log.Println("Server starting on :8080")
+	Log.Info("Server starting on :8080")
 	r.Run(":8080")
 }
 
@@ -84,12 +89,54 @@ func initDB() {
 	var err error
 	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
+		Log.WithError(err).Fatal("Failed to connect to database")
 	}
 
 	// Auto-migrate the schema
-	db.AutoMigrate(&User{})
-	log.Println("Database connected and migrated")
+	LogDatabase("migrate", "users").Info("Running database migration")
+	err = db.AutoMigrate(&User{})
+	if err != nil {
+		Log.WithError(err).Fatal("Failed to migrate database")
+	}
+
+	Log.Info("Database connected and migrated successfully")
+}
+
+// Logging middleware
+func loggingMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		method := c.Request.Method
+
+		// Process request
+		c.Next()
+
+		// Log after processing
+		duration := time.Since(start)
+		statusCode := c.Writer.Status()
+
+		entry := LogRequest(method, path, getUserIDFromContext(c))
+		entry = entry.WithFields(map[string]interface{}{
+			"status_code": statusCode,
+			"duration_ms": duration.Milliseconds(),
+			"client_ip":   c.ClientIP(),
+		})
+
+		if statusCode >= 400 {
+			entry.Warn("Request completed with error")
+		} else {
+			entry.Info("Request completed successfully")
+		}
+	}
+}
+
+// Helper to get user ID from context for logging
+func getUserIDFromContext(c *gin.Context) string {
+	if userID, exists := c.Get("user_id"); exists {
+		return strconv.Itoa(int(userID.(uint)))
+	}
+	return "anonymous"
 }
 
 // JWT helper functions
@@ -106,6 +153,7 @@ func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
+			Log.Warn("Missing authorization header")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
@@ -117,6 +165,7 @@ func authMiddleware() gin.HandlerFunc {
 		})
 
 		if err != nil || !token.Valid {
+			Log.WithError(err).Warn("Invalid JWT token")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -133,13 +182,17 @@ func authMiddleware() gin.HandlerFunc {
 func signup(c *gin.Context) {
 	var req SignupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		Log.WithError(err).Warn("Invalid signup request")
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	LogAuth("signup_attempt", req.Email).Info("User signup attempt")
+
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
+		Log.WithError(err).Error("Failed to hash password")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 		return
 	}
@@ -151,7 +204,7 @@ func signup(c *gin.Context) {
 		Password: string(hashedPassword),
 	}
 
-	if err := db.Create(&user).Error; err != nil {
+	if err := CreateUserWithRetry(&user); err != nil {
 		if strings.Contains(err.Error(), "duplicate key") {
 			c.JSON(http.StatusConflict, gin.H{"error": "Email already exists"})
 			return
@@ -163,9 +216,12 @@ func signup(c *gin.Context) {
 	// Generate JWT
 	token, err := generateJWT(user.ID)
 	if err != nil {
+		Log.WithError(err).Error("Failed to generate JWT")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
+
+	LogAuth("signup_success", req.Email).WithField("user_id", user.ID).Info("User created successfully")
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "User created successfully",
@@ -177,19 +233,24 @@ func signup(c *gin.Context) {
 func login(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		Log.WithError(err).Warn("Invalid login request")
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Find user by email
-	var user User
-	if err := db.Where("email = ?", req.Email).First(&user).Error; err != nil {
+	LogAuth("login_attempt", req.Email).Info("User login attempt")
+
+	// Find user by email with retry
+	user, err := FindUserByEmailWithRetry(req.Email)
+	if err != nil {
+		LogAuth("login_failed", req.Email).Warn("User not found")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
 	// Check password
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
+		LogAuth("login_failed", req.Email).Warn("Invalid password")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
@@ -197,9 +258,12 @@ func login(c *gin.Context) {
 	// Generate JWT
 	token, err := generateJWT(user.ID)
 	if err != nil {
+		Log.WithError(err).Error("Failed to generate JWT")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
+
+	LogAuth("login_success", req.Email).WithField("user_id", user.ID).Info("User logged in successfully")
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Login successful",
@@ -210,42 +274,54 @@ func login(c *gin.Context) {
 
 // CRUD handlers
 func getUsers(c *gin.Context) {
-	var users []User
-	db.Find(&users)
+	users, err := GetAllUsersWithRetry()
+	if err != nil {
+		LogDatabase("select", "users").WithError(err).Error("Failed to fetch users")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch users"})
+		return
+	}
+
+	LogDatabase("select", "users").WithField("count", len(users)).Info("Users fetched successfully")
 	c.JSON(http.StatusOK, gin.H{"users": users})
 }
 
 func getUser(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
+		Log.WithError(err).Warn("Invalid user ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
-	var user User
-	if err := db.First(&user, id).Error; err != nil {
+	user, err := FindUserByIDWithRetry(uint(id))
+	if err != nil {
+		LogDatabase("select", "users").WithField("user_id", id).Warn("User not found")
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
 
+	LogDatabase("select", "users").WithField("user_id", id).Info("User fetched successfully")
 	c.JSON(http.StatusOK, gin.H{"user": user})
 }
 
 func updateUser(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
+		Log.WithError(err).Warn("Invalid user ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
 	var req UpdateUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		Log.WithError(err).Warn("Invalid update request")
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	var user User
-	if err := db.First(&user, id).Error; err != nil {
+	user, err := FindUserByIDWithRetry(uint(id))
+	if err != nil {
+		LogDatabase("select", "users").WithField("user_id", id).Warn("User not found for update")
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
@@ -258,7 +334,7 @@ func updateUser(c *gin.Context) {
 		user.Email = req.Email
 	}
 
-	if err := db.Save(&user).Error; err != nil {
+	if err := UpdateUserWithRetry(user); err != nil {
 		if strings.Contains(err.Error(), "duplicate key") {
 			c.JSON(http.StatusConflict, gin.H{"error": "Email already exists"})
 			return
@@ -266,6 +342,8 @@ func updateUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user"})
 		return
 	}
+
+	LogDatabase("update", "users").WithField("user_id", id).Info("User updated successfully")
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "User updated successfully",
@@ -276,14 +354,18 @@ func updateUser(c *gin.Context) {
 func deleteUser(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
+		Log.WithError(err).Warn("Invalid user ID format")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
-	if err := db.Delete(&User{}, id).Error; err != nil {
+	if err := DeleteUserWithRetry(uint(id)); err != nil {
+		LogDatabase("delete", "users").WithError(err).WithField("user_id", id).Error("Failed to delete user")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
 		return
 	}
+
+	LogDatabase("delete", "users").WithField("user_id", id).Info("User deleted successfully")
 
 	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
 }
