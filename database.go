@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -12,8 +13,9 @@ import (
 // CreateUserWithRetry creates a user with retry logic
 func CreateUserWithRetry(user *User) error {
 	config := DefaultRetryConfig()
+	start := time.Now()
 
-	return ExecuteWithRetry("create_user", func() error {
+	err := ExecuteWithRetry("create_user", func() error {
 		LogDatabase("create", "users").WithField("email", user.Email).Debug("Attempting to create user")
 
 		err := db.Create(user).Error
@@ -26,12 +28,22 @@ func CreateUserWithRetry(user *User) error {
 		}
 		return err
 	}, config)
+
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordDatabaseOperation("create", "users", status, time.Since(start))
+
+	return err
 }
 
 // FindUserByEmailWithRetry finds a user by email with retry logic
 func FindUserByEmailWithRetry(email string) (*User, error) {
 	var user User
 	config := DefaultRetryConfig()
+	start := time.Now()
 
 	err := ExecuteWithRetry("find_user_by_email", func() error {
 		LogDatabase("select", "users").WithField("email", email).Debug("Attempting to find user by email")
@@ -47,6 +59,13 @@ func FindUserByEmailWithRetry(email string) (*User, error) {
 		return err
 	}, config)
 
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordDatabaseOperation("select", "users", status, time.Since(start))
+
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +76,7 @@ func FindUserByEmailWithRetry(email string) (*User, error) {
 func FindUserByIDWithRetry(id uint) (*User, error) {
 	var user User
 	config := DefaultRetryConfig()
+	start := time.Now()
 
 	err := ExecuteWithRetry("find_user_by_id", func() error {
 		LogDatabase("select", "users").WithField("user_id", id).Debug("Attempting to find user by ID")
@@ -72,6 +92,13 @@ func FindUserByIDWithRetry(id uint) (*User, error) {
 		return err
 	}, config)
 
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordDatabaseOperation("select", "users", status, time.Since(start))
+
 	if err != nil {
 		return nil, err
 	}
@@ -81,8 +108,9 @@ func FindUserByIDWithRetry(id uint) (*User, error) {
 // UpdateUserWithRetry updates a user with retry logic
 func UpdateUserWithRetry(user *User) error {
 	config := DefaultRetryConfig()
+	start := time.Now()
 
-	return ExecuteWithRetry("update_user", func() error {
+	err := ExecuteWithRetry("update_user", func() error {
 		LogDatabase("update", "users").WithField("user_id", user.ID).Debug("Attempting to update user")
 
 		err := db.Save(user).Error
@@ -95,29 +123,56 @@ func UpdateUserWithRetry(user *User) error {
 		}
 		return err
 	}, config)
+
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordDatabaseOperation("update", "users", status, time.Since(start))
+
+	return err
 }
 
 // DeleteUserWithRetry deletes a user with retry logic
 func DeleteUserWithRetry(id uint) error {
 	config := DefaultRetryConfig()
+	start := time.Now()
 
-	return ExecuteWithRetry("delete_user", func() error {
+	err := ExecuteWithRetry("delete_user", func() error {
 		LogDatabase("delete", "users").WithField("user_id", id).Debug("Attempting to delete user")
 
 		return db.Delete(&User{}, id).Error
 	}, config)
+
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordDatabaseOperation("delete", "users", status, time.Since(start))
+
+	return err
 }
 
 // GetAllUsersWithRetry gets all users with retry logic
 func GetAllUsersWithRetry() ([]User, error) {
 	var users []User
 	config := DefaultRetryConfig()
+	start := time.Now()
 
 	err := ExecuteWithRetry("get_all_users", func() error {
 		LogDatabase("select", "users").Debug("Attempting to fetch all users")
 
 		return db.Find(&users).Error
 	}, config)
+
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordDatabaseOperation("select", "users", status, time.Since(start))
 
 	if err != nil {
 		return nil, err

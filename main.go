@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
+	"google.golang.org/grpc"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -36,7 +38,7 @@ type LoginRequest struct {
 	Password string `json:"password" binding:"required"`
 }
 
-type UpdateUserRequest struct {
+type RestUpdateUserRequest struct {
 	Name  string `json:"name"`
 	Email string `json:"email"`
 }
@@ -49,15 +51,23 @@ var (
 func main() {
 	// Initialize logger first
 	Init()
-	Log.Info("Starting REST API server")
+	Log.Info("Starting hybrid REST + gRPC API server")
 
 	// Initialize database
 	initDB()
 
-	// Setup Gin router with logging middleware
+	// Start gRPC server in a goroutine
+	go startGrpcServer()
+
+	// Setup Gin router with logging and metrics middleware
 	r := gin.New()
 	r.Use(loggingMiddleware())
+	r.Use(PrometheusMiddleware())
 	r.Use(gin.Recovery())
+
+	// Health check and metrics routes
+	r.GET("/healthz", HealthCheckHandler)
+	SetupMetricsRoutes(r)
 
 	// Public routes
 	r.POST("/signup", signup)
@@ -73,8 +83,14 @@ func main() {
 		protected.DELETE("/users/:id", deleteUser)
 	}
 
-	Log.Info("Server starting on :8080")
-	r.Run(":8080")
+	Log.Info("REST server starting on :8080")
+	Log.Info("gRPC server starting on :50051")
+	Log.Info("Metrics available at :8080/metrics")
+	Log.Info("Health check available at :8080/healthz")
+
+	if err := r.Run(":8080"); err != nil {
+		Log.WithError(err).Fatal("Failed to start REST server")
+	}
 }
 
 func initDB() {
@@ -100,6 +116,28 @@ func initDB() {
 	}
 
 	Log.Info("Database connected and migrated successfully")
+}
+
+// startGrpcServer starts the gRPC server
+func startGrpcServer() {
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		Log.WithError(err).Fatal("Failed to listen on :50051")
+	}
+
+	// Create gRPC server with interceptors
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(GrpcPrometheusInterceptor()),
+	)
+
+	// Register the user service
+	userService := NewGrpcUserService()
+	RegisterUserServiceServer(grpcServer, userService)
+
+	Log.Info("gRPC server listening on :50051")
+	if err := grpcServer.Serve(lis); err != nil {
+		Log.WithError(err).Fatal("Failed to serve gRPC")
+	}
 }
 
 // Logging middleware
@@ -312,7 +350,7 @@ func updateUser(c *gin.Context) {
 		return
 	}
 
-	var req UpdateUserRequest
+	var req RestUpdateUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Log.WithError(err).Warn("Invalid update request")
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
